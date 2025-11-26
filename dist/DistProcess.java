@@ -38,6 +38,17 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 
     String myWorkerZNode = null;
     AtomicInteger assignmentIndex = new AtomicInteger(0);
+    
+    static final long TIME_SLICE_MS = 2000;   // 2 second slice (should test diff values)
+
+    // Worker thread reference
+    Thread workerThread = null;
+
+    // The task currently being executed by this worker
+    DistTask currentTask = null;
+
+    // The name of the assignment node we are working on
+    String currentAssignmentNode = null;
 
     DistProcess(String zkhost)
     {
@@ -59,10 +70,10 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             runForManager();	// See if you can become the manager (i.e, no other manager exists)
             isManager=true;
 
-            if (zk.exists("/dist03/assignment", false) == null) // create assignment directory if non-existent yet
-            {
-                zk.create("/dist03/assignment", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-            }
+            // if (zk.exists("/dist03/assignment", false) == null) // create assignment directory if non-existent yet
+            // {
+            //     zk.create("/dist03/assignment", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            // }
 
             getTasks(); // Install monitoring on any new tasks that will be created.
             getWorkers(); // monitor new workers
@@ -99,6 +110,20 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
     // Try to become the manager.
     void runForManager() throws UnknownHostException, KeeperException, InterruptedException
     {
+         // Ensure parent znode /dist03 exists
+        if (zk.exists("/dist03", false) == null) {
+            zk.create("/dist03", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        }
+        if (zk.exists("/dist03/tasks", false) == null) {
+            zk.create("/dist03/tasks", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        }
+        if (zk.exists("/dist03/workers", false) == null) {
+            zk.create("/dist03/workers", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        }
+        if (zk.exists("/dist03/assign", false) == null) {
+            zk.create("/dist03/assign", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        }
+
         //Try to create an ephemeral node to be the manager, put the hostname and pid of this process as the data.
         // This is an example of Synchronous API invocation as the function waits for the execution and no callback is involved..
         zk.create("/dist03/manager", pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
@@ -147,6 +172,8 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             {
                 zk.getChildren(e.getPath(), this, this, null);
             }
+  
+
         }
     }
 
@@ -204,60 +231,96 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             return;
         }
 
-        if (isManager && path != null && path.startsWith("/dist03/assignment")) // manager will assign tasks when child list changes
+        if (isManager && path != null && path.startsWith("/dist03/tasks")) // manager will assign tasks when child list changes
+ 
         {
             assignTasks();
             return;
         }
 
         // if process is worker and has assignments
-        if (!isManager && myWorkerZNode != null && path != null && path.equals("/dist03/assign/" + myWorkerZNode))
+        // Worker received task
+        if (!isManager && myWorkerZNode != null && path != null && path.startsWith("/dist03/assign/" + myWorkerZNode))
         {
             if (children == null || children.size() == 0)
             {
+                System.out.println("WORKER: Assign callback fired but no children.");
                 return;
             }
+
             String assignment = children.get(0);
+            currentAssignmentNode = "/dist03/assign/" + myWorkerZNode + "/" + assignment;
+
             try
             {
-                String assignmentNode = "/dist03/assign/" + myWorkerZNode + "/" + assignment;
-                byte[] taskSerialized = zk.getData(assignmentNode, false, null);
+                byte[] taskSerialized = zk.getData(currentAssignmentNode, false, null);
 
-                // deserialize
-                ByteArrayInputStream inputStream = new ByteArrayInputStream(taskSerialized);
-                ObjectInput input = new ObjectInputStream(inputStream);
-                DistTask diskTask = (DistTask) input.readObject();
+                ByteArrayInputStream bis = new ByteArrayInputStream(taskSerialized);
+                ObjectInputStream ois = new ObjectInputStream(bis);
+                currentTask = (DistTask) ois.readObject();
 
-                diskTask.compute();
+                System.out.println("WORKER: Received task " + assignment);
 
-                // serialize result
-                ByteArrayOutputStream bOutputStream = new ByteArrayOutputStream();
-                ObjectOutputStream oOutputStream = new ObjectOutputStream(bOutputStream);
-                oOutputStream.writeObject(diskTask); 
-                oOutputStream.flush();
-                byte[] resultBytes = bOutputStream.toByteArray();
+                // START TIME-SLICED EXECUTION THREAD 
+                workerThread = new Thread(() -> {
+                    try {
+                        System.out.println("WORKER: Starting compute() for " + assignment);
 
-                // result written as child of task node
-                if (zk.exists("/dist03/tasks/" + assignment + "/result", false) == null)
-                {
-                    zk.create("/dist03/tasks" + assignment + "/result", resultBytes, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-                }
+                        // Run compute() until interrupted
+                        currentTask.compute();
 
-                //empty assignment node
-                try
-                {
-                    zk.delete(assignmentNode, -1); 
-                }
-                catch (KeeperException.NoNodeException nne) {}
+                        // If done normally:
+                        System.out.println("WORKER: Task finished normally " + assignment);
+                        writeTaskResultAndCleanup(assignment);
+
+                    } catch (InterruptedException ie) {
+                        // TIME SLICE EXPIRED
+                        System.out.println("WORKER: TIME SLICE EXPIRED for task " + assignment);
+                        // Save partial results
+                        savePartialTaskState(assignment);
+
+                        // Tell manager worker is idle by deleting assignment node
+                        try {
+                            zk.delete(currentAssignmentNode, -1);
+                        } catch (Exception ignore) {}
+
+
+
+
+
+                        
+
+                    } catch (Exception other) {
+                        System.out.println("WORKER ERROR: " + other);
+                    }
+
+                    workerThread = null;
+                    currentTask = null;
+                });
+
+                workerThread.start();
+
+                // INTERRUPT AFTER TIME SLICE 
+                Thread interrupter = new Thread(() -> {
+                    try {
+                        Thread.sleep(TIME_SLICE_MS);
+                        if (workerThread != null && workerThread.isAlive()) {
+                            System.out.println("WORKER: Interrupting worker thread for time-slice end");
+                            workerThread.interrupt();
+                        }
+                    } catch (Exception ignored) {}
+                });
+                interrupter.start();
+
             }
-            catch(NodeExistsException nee){System.out.println(nee);}
-            catch(KeeperException ke){System.out.println(ke);}
-            catch(InterruptedException ie){System.out.println(ie);}
-            catch(IOException io){System.out.println(io);}
-            catch(ClassNotFoundException cne){System.out.println(cne);}
+            catch (Exception e)
+            {
+                System.out.println("WORKER: Error handling assignment " + e);
+            }
 
             return;
         }
+
 
         // tasks have changed
         if ("/dist03/tasks".equals(path) && isManager)
@@ -267,49 +330,55 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             return;
         }
 
-        // fallback
-        for(String c: children)
-        {
-            System.out.println("Unhandled case with child:" + c);
-        }
-
-        // for(String c: children)
-        // {
-        //     System.out.println(c);
-        //     try
-        //     {
-        //         //TODO There is quite a bit of worker specific activities here,
-        //         // that should be moved done by a process function as the worker.
-
-        //         //TODO!! This is not a good approach, you should get the data using an async version of the API.
-        //         byte[] taskSerial = zk.getData("/dist03/tasks/"+c, false, null);
-
-        //         // Re-construct our task object.
-        //         ByteArrayInputStream bis = new ByteArrayInputStream(taskSerial);
-        //         ObjectInput in = new ObjectInputStream(bis);
-        //         DistTask dt = (DistTask) in.readObject();
-
-        //         //Execute the task.
-        //         //TODO: Again, time consuming stuff. Should be done by some other thread and not inside a callback!
-        //         dt.compute();
-                
-        //         // Serialize our Task object back to a byte array!
-        //         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        //         ObjectOutputStream oos = new ObjectOutputStream(bos);
-        //         oos.writeObject(dt); oos.flush();
-        //         taskSerial = bos.toByteArray();
-
-        //         // Store it inside the result node.
-        //         zk.create("/dist03/tasks/"+c+"/result", taskSerial, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-        //         //zk.create("/distXX/tasks/"+c+"/result", ("Hello from "+pinfo).getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-        //     }
-        //     catch(NodeExistsException nee){System.out.println(nee);}
-        //     catch(KeeperException ke){System.out.println(ke);}
-        //     catch(InterruptedException ie){System.out.println(ie);}
-        //     catch(IOException io){System.out.println(io);}
-        //     catch(ClassNotFoundException cne){System.out.println(cne);}
-        // }
     }
+    ////TIME-SLICE HELPER METHODS////
+    
+    // Write result to zookeeper 
+    private void writeTaskResultAndCleanup(String assignment) {
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(bos);
+            oos.writeObject(currentTask);
+            oos.flush();
+            byte[] resultBytes = bos.toByteArray();
+
+            System.out.println("WORKER: Writing FINAL RESULT for task " + assignment);
+
+            // Store result
+            String resultPath = "/dist03/tasks/" + assignment + "/result";
+            if (zk.exists(resultPath, false) == null) {
+                zk.create(resultPath, resultBytes, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            }
+
+            // remove assignment
+            zk.delete(currentAssignmentNode, -1);
+
+        } catch (Exception e) {
+            System.out.println("WORKER: Error writing result: " + e);
+        }
+    }
+
+
+    // Save partial state
+    private void savePartialTaskState(String assignment) {
+        try {
+            System.out.println("WORKER: Saving PARTIAL STATE for " + assignment);
+
+            // Serialize partial task state
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(bos);
+            oos.writeObject(currentTask);
+            oos.flush();
+            byte[] partialBytes = bos.toByteArray();
+
+            // Overwrite assignment node with partial state
+            zk.setData(currentAssignmentNode, partialBytes, -1);
+
+        } catch (Exception e) {
+            System.out.println("WORKER: Failed to save partial state: " + e);
+        }
+    }
+
 
     public void InitializeWorker()
     {
@@ -456,19 +525,29 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
                 { 
                     continue;
                 }
+                
+                // If task is assigned but worker finished its time slice (partial result exists),
+                // treat it as NOT assigned.
+                boolean assignedAndWorking = false;
 
-                // skip if already assigned to any worker
-                boolean alreadyAssigned = false;
-                for (String worker : workers) 
+                for (String worker: workers)
                 {
                     String potentialAssignment = "/dist03/assign/" + worker + "/" + task;
-                    if (zk.exists(potentialAssignment, false) != null) 
-                    { 
-                        alreadyAssigned = true; 
-                        break; 
+
+                    if (zk.exists(potentialAssignment, false) != null)
+                    {
+                        // This means task is currently inside a worker assignment directory.
+                        // Check if worker thread is still running? ZK cannot tell.
+                        // So assume: an assignment node without a running worker means reassignable.
+                        assignedAndWorking = true;
+                        break;
                     }
                 }
-                if (alreadyAssigned) continue;
+
+                if (assignedAndWorking) {
+                    System.out.println("MANAGER: Task " + task + " is currently assigned; checking if eligible for reassign.");
+                    // Don't continue, reassign it.
+                }               
 
                 if (idle.isEmpty()) break; // no idle worker left
 
@@ -509,6 +588,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         dt.startProcess();
 
         //Replace this with an approach that will make sure that the process is up and running forever.
-        Thread.sleep(20000); 
+        Thread.sleep(Long.MAX_VALUE);//Thread.sleep(20000); 
+
     }
 }
