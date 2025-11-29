@@ -405,17 +405,25 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             // sequential node num
             myWorkerZNode = myNode.substring(myNode.lastIndexOf('/') + 1);
 
-            //  create my assign dir if it doesn't exist
+            //  create my general assign dir if it doesn't exist
             if (zk.exists("/dist03/assign", false) == null) 
             {
                 zk.create("/dist03/assign", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             }
             String myAssignPath = "/dist03/assign/" + myWorkerZNode;
             // create the worker's assignment dir if it doesn't exist
-            if (zk.exists(myAssignPath, false) == null) 
+            try 
             {
                 zk.create(myAssignPath, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             }
+            catch (KeeperException.NodeExistsException nee) 
+            {
+                System.out.println("WORKER: Assignment path " + myAssignPath + " already exists. Proceeding.");
+            }
+            // if (zk.exists(myAssignPath, false) == null) 
+            // {
+            //     zk.create(myAssignPath, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            // }
 
             // watch my assign dir for new assignments
             zk.getChildren(myAssignPath, this, this, null);
@@ -579,7 +587,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         }
         if (idle.isEmpty()) // no idle workers
         {
-            System.out.println("[ERROR - TASK ASSIGNMENT] No worker is currently available to perform tasks,.");
+            System.out.println("[NO WORKER] No worker is currently available to perform tasks.");
             return;
         }
 
@@ -671,8 +679,6 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             });
             sortedTasks.addAll(tasksList);
         }
-        System.out.println("[DEBUG] [ORDERED TASKS] : " + iterationToTasksMap);
-
         return sortedTasks;
     }
 
