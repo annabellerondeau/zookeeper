@@ -517,9 +517,48 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             currentlyAssignedTasks.addAll(assignedList);
         }
 
+        List<String> newTasks = new ArrayList<>();
+        List<String> partialTasks = new ArrayList<>();
+
+        //prioritize new tasks over partially completed tasks. 
+        for (String task : tasks) {           
+            try 
+            {
+                if (zk.exists("/dist03/tasks/" + task + "/result", false) != null) // if already completed
+                {
+                    continue; 
+                }
+                if (currentlyAssignedTasks.contains(task)) // if already assigned
+                {
+                    continue; 
+                }
+                if (zk.getData("/dist03/tasks/" + task, false, null).length > 0) // when data was updated, its length will be greater than 0
+                {
+                    partialTasks.add(task);
+                } 
+                else // new task
+                {
+                    newTasks.add(task); 
+                }
+            } 
+            catch (Exception e) 
+            {
+                 System.out.println("Error checking task data for " + task + ": " + e);
+            }
+        }
+        
+        List<String> prioritizedTasks = new ArrayList<>();
+        prioritizedTasks.addAll(newTasks);    // assign new tasks first
+        prioritizedTasks.addAll(partialTasks); // assign partial tasks second
+
+        System.out.println("MANAGER PRIORITY QUEUE: Processing " + prioritizedTasks.size() + " available tasks.");
+        System.out.println(" - New/Short Tasks (High Priority): " + newTasks);
+        System.out.println(" - Partial/Long Tasks (Low Priority): " + partialTasks);
+
         // build list of idle workers
         List<String> idle = new ArrayList<>();
-        for (String worker : workers) {
+        for (String worker : workers) 
+        {
             List<String> achildren = assignMap.get(worker);
             if (achildren == null || achildren.size() == 0) 
             {
@@ -534,7 +573,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         }
 
         // assign tasks to idle workers (one per worker)
-        for (String task : tasks)
+        for (String task : prioritizedTasks)
         {
             try {
                 if (zk.exists("/dist03/tasks/" + task + "/result", false) != null) // already completed tasks
