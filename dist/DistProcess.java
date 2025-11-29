@@ -16,6 +16,8 @@ import java.lang.management.*;
 import org.apache.zookeeper.*;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.KeeperException.*;
+import org.apache.zookeeper.data.Stat;
+
 
 // TODO
 // Replace XX with your group number.
@@ -152,12 +154,12 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         {
             if(e.getPath() != null && e.getPath().equals("/dist03/tasks")) // fetch new tasks
             {
-                System.out.println("[NEW TASK] New task was received.");
+                System.out.println("[TASK] Task Directory was updated.");
                 getTasks();
             }
             else if(e.getPath() != null && e.getPath().equals("/dist03/workers")) // fetch new workers
             {
-                System.out.println("[NEW WORKER] New worker was added.");
+                System.out.println("[NEW WORKER] Worker directory changed.");
                 getWorkers();
             }
             else if (myWorkerZNode != null && e.getPath() != null && e.getPath().equals("/dist03/assign/" + myWorkerZNode)) // this process' assignment directory changed
@@ -195,7 +197,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         //		The worker must invoke the "compute" function of the Task send by the client.
         //What to do if you do not have a free worker process?
 
-        System.out.println("DISTAPP : processResult : " + rc + ":" + path + ":" + ctx);
+        System.out.println("DISTAPP : processResult : " + rc + ":" + path + ":" + ctx); // response code, path, 
 
         if ("/dist03/workers".equals(path)) // if workers changed
         {
@@ -241,7 +243,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         {
             if (children == null || children.size() == 0)
             {
-                System.out.println("WORKER: Assign callback fired but no children.");
+                //System.out.println("WORKER: Assign callback fired but no children.");
                 return;
             }
 
@@ -346,7 +348,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             oos.flush();
             byte[] resultBytes = bos.toByteArray();
 
-            System.out.println("WORKER: Writing FINAL RESULT for task " + assignment);
+            System.out.println("[TASK COMPLETED] WORKER: Writing FINAL RESULT for task " + assignment);
 
             // Store result
             String resultPath = "/dist03/tasks/" + assignment + "/result";
@@ -474,7 +476,6 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             // get current workers and tasks
             workers = zk.getChildren("/dist03/workers", false);
             tasks = zk.getChildren("/dist03/tasks", false);            
-            //Collections.sort(tasks); // prioritize the oldest unprocessed tasks
         } 
         catch (Exception e) 
         {
@@ -548,12 +549,22 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
         }
         
         List<String> prioritizedTasks = new ArrayList<>();
+        List<String> orderedPartialTasks;
+        try 
+        {
+            orderedPartialTasks = orderPartialTasks(partialTasks);
+        }
+        catch (InterruptedException | NumberFormatException | KeeperException e)
+        {
+            System.out.println("Error ordering partial tasks: " + e);
+            orderedPartialTasks = partialTasks; // fallback to original order if error occurs
+        }
+
         prioritizedTasks.addAll(newTasks);    // assign new tasks first
-        prioritizedTasks.addAll(partialTasks); // assign partial tasks second
+        prioritizedTasks.addAll(orderedPartialTasks); // assign partial tasks second
 
         System.out.println("MANAGER PRIORITY QUEUE: Processing " + prioritizedTasks.size() + " available tasks.");
-        System.out.println(" - New/Short Tasks (High Priority): " + newTasks);
-        System.out.println(" - Partial/Long Tasks (Low Priority): " + partialTasks);
+        System.out.println("[DEBUG] [PRIORITY QUEUE] : " + prioritizedTasks);
 
         // build list of idle workers
         List<String> idle = new ArrayList<>();
@@ -613,15 +624,56 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
                 if (zk.exists(assignPath, false) == null) 
                 {
                     zk.create(assignPath, taskSerial, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                    System.out.println("[TASK ASSIGNED] Created assignment node for task " + task + " for worker " + chosen);
                 }
-                System.out.println("Assigned task " + task + " to worker " + chosen);
-
             } 
             catch (Exception e) 
             {
                 System.out.println(e);
             }
         }
+    }
+
+    public List<String> orderPartialTasks(List<String> partialTasks) throws InterruptedException, NumberFormatException, KeeperException
+    {
+        Map<Integer, List<String>> iterationToTasksMap = new TreeMap<>(); // data length, list of tasks with this length
+        
+        for (String partialTask : partialTasks)
+        {
+            Stat stat = new Stat();
+            zk.getData("/dist03/tasks/" + partialTask, false, stat); // fetch stat metadata
+            int version = stat.getVersion(); // version increments with each setData() call
+            
+            List<String> tasksWithSameVersion = iterationToTasksMap.getOrDefault(version, new ArrayList<>());
+            tasksWithSameVersion.add(partialTask);
+            iterationToTasksMap.put(version, tasksWithSameVersion);
+        }
+
+        List<String> sortedTasks = new ArrayList<>();
+
+        for (List<String> tasksList : iterationToTasksMap.values()) // TreeMap sorts by iteration count ascending
+        {
+            Collections.sort(tasksList, (task1, task2) -> 
+            {
+                long taskNum1 = 0;
+                long taskNum2 = 0;
+                try 
+                {
+                    taskNum1 = Long.parseLong(task1.substring(task1.lastIndexOf('-') + 1));
+                    taskNum2 = Long.parseLong(task2.substring(task2.lastIndexOf('-') + 1));
+                } 
+                catch (NumberFormatException e) 
+                {
+                    System.out.println("Error parsing sequence number: " + e.getMessage());
+                    return task1.compareTo(task2);
+                }
+                return Long.compare(taskNum1, taskNum2); 
+            });
+            sortedTasks.addAll(tasksList);
+        }
+        System.out.println("[DEBUG] [ORDERED TASKS] : " + iterationToTasksMap);
+
+        return sortedTasks;
     }
 
     public static void main(String args[]) throws Exception
