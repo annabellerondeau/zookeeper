@@ -168,10 +168,10 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
                 // reinstall watch and let processResult handle work
                 zk.getChildren(e.getPath(), this, this, null);
             }
-            else if (e.getPath() != null && e.getPath().startsWith("/dist03/assign/"))
-            {
-                zk.getChildren(e.getPath(), this, this, null);
-            }
+            // else if (e.getPath() != null && e.getPath().startsWith("/dist03/assign/"))
+            // {
+            //     zk.getChildren(e.getPath(), this, this, null);
+            // }
   
 
         }
@@ -247,7 +247,8 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
                 System.out.println("WORKER: Assign callback fired but no children.");
                 return;
             }
-
+            
+            //Pull latest assignment
             String assignment = children.get(0);
             currentAssignmentNode = "/dist03/assign/" + myWorkerZNode + "/" + assignment;
 
@@ -281,6 +282,8 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 
                         // Tell manager worker is idle by deleting assignment node
                         try {
+                            // ***THIS NEEDS TO BE DONE AFTER TASK IS ASSIGNED TO ANOTHER WORKER, OTHERWISE MANAGER MAY GIVE IT TO ME AGAIN
+                            //(THIS IS NOT SPECIFIED IN THE ASSINGMENT BUT ASSUMING THAT'S THE CASE)
                             zk.delete(currentAssignmentNode, -1);
                         } catch (Exception ignore) {}
 
@@ -305,7 +308,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
                     try {
                         Thread.sleep(TIME_SLICE_MS);
                         if (workerThread != null && workerThread.isAlive()) {
-                            System.out.println("WORKER: Interrupting worker thread for time-slice end");
+                            System.out.println("WORKER: Interrupting worker thread. Bc work is taking longer than " +TIME_SLICE_MS +"s");
                             workerThread.interrupt();
                         }
                     } catch (Exception ignored) {}
@@ -371,8 +374,15 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
             oos.flush();
             byte[] partialBytes = bos.toByteArray();
 
-            // Overwrite assignment node with partial state
-            zk.setData(currentAssignmentNode, partialBytes, -1);
+            // Add remaining work as new task 
+            String newTaskPath = zk.create(
+                "/dist03/tasks/task-",
+                partialBytes, 
+                Ids.OPEN_ACL_UNSAFE, 
+                CreateMode.PERSISTENT_SEQUENTIAL
+            );
+            System.out.println("WORKER: Re-enqueued partial task as " + newTaskPath);
+
 
         } catch (Exception e) {
             System.out.println("WORKER: Failed to save partial state: " + e);
