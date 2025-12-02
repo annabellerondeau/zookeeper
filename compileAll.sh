@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # compile task
-echo "Compiling TASK..."
+echo "Compiling task"
 cd task && ./compiletask.sh
 if [ $? -ne 0 ]; then
     echo "ERROR: Task compilation failed."
@@ -9,7 +9,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # compile dist
-echo "Compiling DIST server..."
+echo "Compiling server"
 cd ../dist && ./compilesrvr.sh
 if [ $? -ne 0 ]; then
     echo "ERROR: Server compilation failed."
@@ -17,7 +17,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # compile clnt
-echo "Compiling CLNT client..."
+echo "Compiling client"
 cd ../clnt && ./compileclnt.sh
 if [ $? -ne 0 ]; then
     echo "ERROR: Client compilation failed."
@@ -25,5 +25,4 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Build finished"
-# Return to the root directory
 cd ..
